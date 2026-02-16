@@ -26,7 +26,7 @@ cspin list                 # see all pins
 ## Install
 
 ```bash
-git clone https://github.com/nicberk/claude-session-pin.git
+git clone https://github.com/berkayoymak/claude-session-pin.git
 cd claude-session-pin
 bash install.sh
 ```
