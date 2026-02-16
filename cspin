@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# cspin - Claude Session Pin
+# Pin human-friendly names to Claude Code sessions.
+# A hook auto-follows the name across UUID changes on compact/clear.
+#
+# Storage: ~/.cspin/
+#   <name>                     alias file (line 1: UUID, line 2: CWD)
+#   .tracking/<uuid>           tracking file (content: alias name)
+#   .tracking/.pid-<pid>       PID marker (line 1: alias, line 2: UUID)
+#   .tracking/.pending-<pid>   pending registration from cspin new
+
+set -euo pipefail
+
+CSPIN_DIR="${CSPIN_DIR:-$HOME/.cspin}"
+TRACK_DIR="$CSPIN_DIR/.tracking"
+mkdir -p "$CSPIN_DIR" "$TRACK_DIR"
+
+usage() {
+    cat <<'EOF'
+cspin - Claude Session Pin
+Pin human-friendly names to Claude Code sessions.
+
+USAGE
+  cspin new <name> [claude-args...]   Start a new named session
+  cspin resume <name>                 Resume a named session
+  cspin delete <name>                 Remove a pin (session data kept)
+  cspin list                          Show all pinned sessions
+
+EXAMPLES
+  cspin new auth-refactor             Start and pin as "auth-refactor"
+  cspin new debug -- --model sonnet   Pass extra args to claude
+  cspin resume auth-refactor          Resume by name
+  cspin list                          See all pins
+
+ENVIRONMENT
+  CSPIN_DIR    Override storage dir (default: ~/.cspin)
+
+AUTO-TRACKING
+  A hook (cspin-hook.sh) watches for compact/clear events.
+  When Claude creates a new session ID, the pin auto-updates.
+  Old UUIDs are archived as <name>~1, <name>~2, etc.
+
+EOF
+}
+
+encode_path() {
+    # Encode a path the way Claude does: /foo/bar → -foo-bar
+    local p="$1"
+    echo "${p//\//-}"
+}
+
+activate_tracking() {
+    local name="$1" uuid="$2"
+    [[ -n "$uuid" ]] || return 0
+    # Remove any stale tracking for this alias (different UUID)
+    for tf in "$TRACK_DIR"/[0-9a-f]*; do
+        [[ -f "$tf" ]] || continue
+        if [[ "$(cat "$tf")" == "$name" ]]; then
+            rm -f "$tf"
+        fi
+    done
+    echo "$name" > "$TRACK_DIR/$uuid"
+}
+
+get_last_session_id() {
+    if [[ -f "$HOME/.claude/history.jsonl" ]]; then
+        tail -1 "$HOME/.claude/history.jsonl" | python3 -c "
+import sys, json
+line = sys.stdin.read().strip()
+if line:
+    data = json.loads(line)
+    sid = data.get('sessionId', '')
+    proj = data.get('project', '')
+    if sid:
+        print(sid)
+        print(proj)
+" 2>/dev/null
+    fi
+}
+
+# ── new ──────────────────────────────────────────────────────────────────────
+
+do_new() {
+    local name="$1"; shift
+
+    if [[ -f "$CSPIN_DIR/$name" ]]; then
+        echo "Error: Name '$name' already exists. Use 'cspin resume $name' or pick a different name." >&2
+        exit 1
+    fi
+
+    # PID-based pending registration
+    # Write a marker keyed by OUR PID. The hook will walk the process tree
+    # from Claude → cspin and find this marker.
+    printf '%s\n%s\n' "$name" "$PWD" > "$TRACK_DIR/.pending-$$"
+
+    # Timestamp marker for fallback (ultra-short sessions where hook never fires)
+    local encoded_cwd
+    encoded_cwd=$(encode_path "$PWD")
+    local claude_proj_dir="$HOME/.claude/projects/$encoded_cwd"
+    mkdir -p "$claude_proj_dir"
+    local marker
+    marker=$(mktemp "$CSPIN_DIR/.marker-XXXXXX")
+    sleep 0.05
+
+    _cspin_cleanup() {
+        # If hook already registered, we're done
+        if [[ -f "$CSPIN_DIR/$name" ]]; then
+            rm -f "$TRACK_DIR/.pending-$$" "$marker"
+            return
+        fi
+        # Fallback: find newest .jsonl created after our marker
+        local uuid=""
+        if [[ -d "$claude_proj_dir" && -f "$marker" ]]; then
+            while IFS= read -r _line; do
+                local _new_file="${_line#* }"
+                [[ -n "$_new_file" ]] || continue
+                local candidate
+                candidate=$(basename "${_new_file%.jsonl}")
+                # Skip UUIDs already tracked by another alias
+                if [[ -f "$TRACK_DIR/$candidate" ]]; then
+                    local owner
+                    owner=$(cat "$TRACK_DIR/$candidate")
+                    [[ "$owner" == "$name" ]] || continue
+                fi
+                uuid="$candidate"
+                break
+            done < <(find "$claude_proj_dir" -maxdepth 1 -name '*.jsonl' \
+                -newer "$marker" -printf '%T@ %p\n' 2>/dev/null \
+                | sort -n)
+        fi
+        # Last resort: history.jsonl
+        if [[ -z "$uuid" ]]; then
+            readarray -t info < <(get_last_session_id)
+            uuid="${info[0]:-}"
+            # Guard: don't steal UUID from another alias
+            if [[ -n "$uuid" && -f "$TRACK_DIR/$uuid" ]]; then
+                local owner
+                owner=$(cat "$TRACK_DIR/$uuid")
+                [[ "$owner" == "$name" ]] || uuid=""
+            fi
+        fi
+        if [[ -n "$uuid" ]]; then
+            printf '%s\n%s\n' "$uuid" "$PWD" > "$CSPIN_DIR/$name"
+            activate_tracking "$name" "$uuid"
+        fi
+        rm -f "$TRACK_DIR/.pending-$$" "$marker"
+    }
+    trap _cspin_cleanup EXIT
+
+    echo "Starting new session '$name'..."
+    claude "$@"
+
+    _cspin_cleanup
+    trap - EXIT
+
+    local uuid
+    uuid=$(head -1 "$CSPIN_DIR/$name" 2>/dev/null || echo "")
+    if [[ -n "$uuid" ]]; then
+        echo "Session '$name' pinned -> ${uuid:0:12}... (tracking enabled)"
+    else
+        echo "Warning: Could not detect session ID. The session may have been too short."
+    fi
+}
+
+# ── resume ───────────────────────────────────────────────────────────────────
+
+do_resume() {
+    local name="$1"
+    local file="$CSPIN_DIR/$name"
+
+    if [[ ! -f "$file" ]]; then
+        echo "Error: No session named '$name'. Run 'cspin list' to see pins." >&2
+        exit 1
+    fi
+
+    local uuid dir
+    uuid=$(head -1 "$file")
+    dir=$(sed -n '2p' "$file")
+
+    # Enable tracking
+    activate_tracking "$name" "$uuid"
+
+    # Write pending marker so hook can link if UUID changes immediately
+    printf '%s\n%s\n' "$name" "${dir:-$PWD}" > "$TRACK_DIR/.pending-$$"
+    trap 'rm -f "$TRACK_DIR/.pending-$$"' EXIT
+
+    if [[ -n "$dir" && -d "$dir" ]]; then
+        echo "Resuming '$name' (${uuid:0:12}...) in $dir"
+        (cd "$dir" && claude --resume "$uuid")
+    else
+        echo "Resuming '$name' (${uuid:0:12}...) in current dir"
+        claude --resume "$uuid"
+    fi
+
+    rm -f "$TRACK_DIR/.pending-$$"
+    trap - EXIT
+}
+
+# ── delete ───────────────────────────────────────────────────────────────────
+
+do_delete() {
+    local name="$1"
+    local file="$CSPIN_DIR/$name"
+
+    if [[ ! -f "$file" ]]; then
+        echo "Error: No pin named '$name'." >&2
+        exit 1
+    fi
+
+    local uuid
+    uuid=$(head -1 "$file")
+
+    # Remove tracking file
+    if [[ -n "$uuid" && -f "$TRACK_DIR/$uuid" ]]; then
+        rm -f "$TRACK_DIR/$uuid"
+    fi
+
+    # Remove PID files that reference this alias
+    for pf in "$TRACK_DIR"/.pid-*; do
+        [[ -f "$pf" ]] || continue
+        if [[ "$(head -1 "$pf")" == "$name" ]]; then
+            rm -f "$pf"
+        fi
+    done
+
+    # Remove archives (name~1, name~2, ...)
+    local archive_count=0
+    for af in "$CSPIN_DIR/${name}~"*; do
+        [[ -f "$af" ]] || continue
+        local af_uuid
+        af_uuid=$(head -1 "$af")
+        [[ -n "$af_uuid" && -f "$TRACK_DIR/$af_uuid" ]] && rm -f "$TRACK_DIR/$af_uuid"
+        rm -f "$af"
+        archive_count=$((archive_count + 1))
+    done
+
+    rm -f "$file"
+
+    local msg="Deleted pin '$name' (${uuid:0:12}...)"
+    [[ $archive_count -gt 0 ]] && msg+=" + $archive_count archive(s)"
+    echo "$msg"
+    echo "Session data in ~/.claude/ is untouched."
+}
+
+# ── list ─────────────────────────────────────────────────────────────────────
+
+do_list() {
+    local found=false
+
+    # Separate base aliases from archives
+    local -a bases=()
+    local -A archive_counts
+
+    for f in "$CSPIN_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        local fname
+        fname=$(basename "$f")
+        [[ "$fname" == .* ]] && continue
+
+        if [[ "$fname" == *~* ]]; then
+            local base="${fname%~*}"
+            archive_counts["$base"]=$(( ${archive_counts["$base"]:-0} + 1 ))
+        else
+            bases+=("$fname")
+            found=true
+        fi
+    done
+
+    if ! $found; then
+        echo "No pinned sessions. Use 'cspin new <name>' to pin one."
+        return
+    fi
+
+    # Sort
+    IFS=$'\n' bases=($(printf '%s\n' "${bases[@]}" | sort)); unset IFS
+
+    printf "%-20s %-14s %-5s %s\n" "NAME" "UUID" "TRACK" "DIRECTORY"
+    printf "%-20s %-14s %-5s %s\n" "────" "────" "─────" "─────────"
+
+    for name in "${bases[@]}"; do
+        local uuid dir tracked arch_info=""
+        uuid=$(head -1 "$CSPIN_DIR/$name")
+        dir=$(sed -n '2p' "$CSPIN_DIR/$name")
+        tracked=" "
+        if [[ -f "$TRACK_DIR/$uuid" ]] && [[ "$(cat "$TRACK_DIR/$uuid")" == "$name" ]]; then
+            tracked="*"
+        fi
+        if [[ -n "${archive_counts[$name]:-}" ]]; then
+            arch_info=" (+${archive_counts[$name]} archived)"
+        fi
+        printf "%-20s %-14s   %-3s %s\n" "${name}${arch_info}" "${uuid:0:12}..." "$tracked" "${dir:--}"
+    done
+}
+
+# ── main dispatch ────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    new)
+        shift
+        name="${1:-}"
+        if [[ -z "$name" ]]; then
+            echo "Usage: cspin new <name> [claude-args...]" >&2
+            exit 1
+        fi
+        shift
+        do_new "$name" "$@"
+        ;;
+    resume)
+        name="${2:-}"
+        if [[ -z "$name" ]]; then
+            echo "Usage: cspin resume <name>" >&2
+            exit 1
+        fi
+        do_resume "$name"
+        ;;
+    delete|rm)
+        name="${2:-}"
+        if [[ -z "$name" ]]; then
+            echo "Usage: cspin delete <name>" >&2
+            exit 1
+        fi
+        do_delete "$name"
+        ;;
+    list)
+        do_list
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    "")
+        do_list
+        ;;
+    *)
+        # If arg matches a saved name, resume it (shorthand)
+        if [[ -f "$CSPIN_DIR/$1" ]]; then
+            do_resume "$1"
+        else
+            echo "Unknown command: $1" >&2
+            echo "Run 'cspin --help' for usage." >&2
+            exit 1
+        fi
+        ;;
+esac
